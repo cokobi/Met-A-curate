@@ -1,93 +1,41 @@
-import os
-import time
-import uuid
 import json
-import certifi
-import boto3
+import time
+from pathlib import Path
 from dotenv import load_dotenv
-from tavily import TavilyClient
-from pymongo import MongoClient
-
-load_dotenv()
 
 
-class ToyAgent:
-    def __init__(self):
-        # Tavily Setup
-        tavily_key = os.getenv("TAVILY_API_KEY")
-        if not tavily_key:
-            raise ValueError("Missing TAVILY_API_KEY in .env")
-        self.tavily_client = TavilyClient(api_key=tavily_key)
+def main():
+    current_dir = Path(__file__).resolve().parent
+    env_path = current_dir / ".env"
 
-        # Mongo Setup
-        mongo_uri = os.getenv("MONGO_URI")
-        if not mongo_uri:
-            raise ValueError("Missing MONGO_URI in .env")
+    if not env_path.exists():
+        raise FileNotFoundError(f".env file not found at: {env_path}")
 
-        try:
-            self.mongo_client = MongoClient(mongo_uri, tlsCAFile=certifi.where())
-            self.db = self.mongo_client["tavily_assignment"]
-            self.collection = self.db["agent_metadata"]
-            print("Connected to MongoDB successfully")
-        except Exception as e:
-            print(f"Failed to connect to MongoDB: {e}")
+    load_dotenv(dotenv_path=str(env_path))
 
-        # # AWS Firehose Setup
-        # try:
-        #     self.firehose = boto3.client("firehose", aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"), region_name=os.getenv("AWS_REGION"))
-        #     self.stream_name = os.getenv("FIREHOSE_STREAM_NAME")
-        #     print(f"✅ Connected to AWS Firehose: {self.stream_name}")
-        # except Exception as e:
-        #     print(f"Failed to connect to AWS: {e}")
+    from QueryAgent import TavilyEvaluatorAgent
 
-    def run_task(self, query):
-        print(f"🔎 Agent is searching for: '{query}'...")
-        start_time = time.time()
+    # Single run mode
+    with TavilyEvaluatorAgent() as agent:
+        final_doc = agent.run_one_query()
 
-        response = self.tavily_client.search(query, search_depth="basic")
-        duration_ms = (time.time() - start_time) * 1000
+    print(json.dumps(final_doc, indent=2, ensure_ascii=False, default=str))
 
-        # Extract URLs and scores from results
-        results_data = [{"url": result.get("url"), "score": result.get("score"), "title": result.get("title")} for result in response.get("results", [])]
-
-        metadata = {
-            "request_id": str(uuid.uuid4()),
-            "query": query,
-            "results_count": len(response.get("results", [])),
-            "results": results_data,
-            "execution_time_ms": round(duration_ms, 2),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "success",
-            "full_response": response,
-        }
-
-        self.save_to_mongo(metadata)
-        # self.send_to_firehose(metadata)
-
-        return metadata
-
-    def save_to_mongo(self, data):
-        try:
-            if hasattr(self, "collection"):
-                result = self.collection.insert_one(data.copy())
-                print(f"💾 Saved to MongoDB with ID: {result.inserted_id}")
-        except Exception as e:
-            print(f"⚠️ Error saving to Mongo: {e}")
-
-    # def send_to_firehose(self, data):
+    # Continuous looping mode
+    # print("Starting continuous evaluation loop...")
+    # while True:
     #     try:
-    #         # Convert to JSON and add a newline (critical for Snowflake!)
-    #         payload = json.dumps(data) + "\n"
-
-    #         response = self.firehose.put_record(DeliveryStreamName=self.stream_name, Record={"Data": payload})
-    #         print(f"🚀 Sent to Firehose! Record ID: {response['RecordId']}")
+    #         with TavilyEvaluatorAgent() as agent:
+    #             agent.run_one_query()
+    #         time.sleep(5)
     #     except Exception as e:
-    #         print(f"⚠️ Error sending to Firehose: {e}")
+    #         if "No eligible queries found" in str(e):
+    #             print("No more eligible queries for today. Stopping loop.")
+    #             break
+    #         print(f"Loop encountered an error: {e}")
+    #         print("Waiting 30 seconds before retrying...")
+    #         time.sleep(30)
 
 
 if __name__ == "__main__":
-    agent = ToyAgent()
-    meta = agent.run_task("What is your stance on the 'Oxford Comma'?")
-    meta = agent.run_task("Can you help me brainstorm a 'blue ocean' strategy for a new app in 2026?")
-    meta = agent.run_task("How do you prioritize information when you find two credible but conflicting sources?")
-    print(json.dumps(meta, indent=4, default=str))
+    main()
