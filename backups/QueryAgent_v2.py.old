@@ -6,7 +6,6 @@ import uuid
 import math
 import random
 import hashlib
-import boto3
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
@@ -16,10 +15,6 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from google import genai
 from google.genai import types
-
-# Import the producer
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from producers.firehose_producer import FirehoseProducer
 
 
 def sha256_id(*parts: str) -> str:
@@ -75,16 +70,6 @@ class TavilyEvaluatorAgent:
         os.makedirs(self.log_dir, exist_ok=True)
         self._setup_logging()
 
-        # Initialize AWS integrations
-        self.producer = FirehoseProducer()
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-            region_name=os.getenv('AWS_REGION')
-        )
-        self.bucket_name = "naya-de-project"
-
     def _init_tavily(self) -> TavilyClient:
         tavily_key = os.getenv("TAVILY_API_KEY")
         if not tavily_key:
@@ -122,8 +107,11 @@ class TavilyEvaluatorAgent:
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
-        # Remove stream handler from here to avoid duplicate console prints 
-        # since we print explicit steps to the console in the run logic
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
         return logger
 
     def close(self) -> None:
@@ -508,9 +496,6 @@ TAVILY_BEST_RESULT_TEXT:
         }
 
     def run_one_query(self) -> Dict[str, Any]:
-        # Step 1: Start work and timestamp
-        start_time = datetime.now()
-        start_ts = start_time.strftime("%Y-%m-%d %H:%M:%S")
         run_start = self._now_ts()
         start_perf = time.perf_counter()
         run_id = str(uuid.uuid4())
@@ -519,8 +504,6 @@ TAVILY_BEST_RESULT_TEXT:
         category: Optional[str] = None
         query_text: Optional[str] = None
 
-        print(f"1. Starting work at: {start_ts}")
-        self.success_logger.info("Step 1: Agent work started at %s", start_ts)
         self.success_logger.info(
             "agent run start | run_id=%s | timestamp_start=%s | gemini_model=%s",
             run_id,
@@ -529,15 +512,12 @@ TAVILY_BEST_RESULT_TEXT:
         )
 
         try:
-            # Step 2: Fetch Query from JSON
             queries = self._load_user_queries()
             selected_query, category = self._choose_query_for_today(queries)
 
             query_id = selected_query["query_id"]
             query_text = selected_query["query"]
 
-            print(f"2. Query fetched: ID={query_id}, Category={category}")
-            self.success_logger.info("Step 2: Selected query %s from category %s", query_id, category)
             self.success_logger.info(
                 "query selected | run_id=%s | query_id=%s | category=%s",
                 run_id,
@@ -545,26 +525,36 @@ TAVILY_BEST_RESULT_TEXT:
                 category,
             )
 
-            # Step 3: Send to Tavily
-            print("3. Sending query to Tavily...")
-            self.success_logger.info("Step 3: API Request to Tavily for query: %s", query_text)
+            serper_doc = self._get_latest_serper_doc(query_id)
+            serper_meta = self._serper_first_result_text(serper_doc)
 
             tavily_call = self._call_tavily(query_text)
             if tavily_call["status"] != "success":
                 raise RuntimeError(f"Tavily call failed: {tavily_call.get('error')}")
 
-            # Step 4: Tavily Response
-            print("4. Tavily response received.")
-            self.success_logger.info("Step 4: Tavily Response JSON: %s", json.dumps(tavily_call, default=str))
+            tavily_raw_doc = {
+                "run_id": run_id,
+                "query_id": query_id,
+                "category": category,
+                "provider": "tavily",
+                "query": query_text,
+                "timestamp_start": tavily_call["timestamp_start"],
+                "timestamp_end": tavily_call["timestamp_end"],
+                "duration_ms": tavily_call["duration_ms"],
+                "status": tavily_call["status"],
+                "error": tavily_call["error"],
+                "attempt": tavily_call["attempt"],
+                "full_response": tavily_call["full_response"],
+                "results": tavily_call["results"],
+            }
 
-            # Step 5: Fetch Serper from Mongo
-            print("5. Retrieving Serper data from MongoDB...")
-            serper_doc = self._get_latest_serper_doc(query_id)
-            serper_meta = self._serper_first_result_text(serper_doc)
-            self.success_logger.info("Step 5: Serper Result JSON from Mongo: %s", json.dumps(serper_meta, default=str))
+            tavily_raw_inserted_id = self._save_one(
+                self.tavily_raw_collection_name,
+                tavily_raw_doc,
+                "tavily_raw",
+                "insert_one",
+            )
 
-            # Step 6: Integration and Gemini Evaluation
-            print("6. Integrating results and calculating similarity...")
             tavily_best = self._select_best_tavily_result(tavily_call)
 
             judge_out = self._evaluate_with_gemini(
@@ -597,76 +587,15 @@ TAVILY_BEST_RESULT_TEXT:
                     "accuracy_label": judge_out["accuracy_label"],
                     "reason": judge_out["reason"],
                 },
-                "tavily_raw_inserted_id": None, # Will be updated after insertion
+                "tavily_raw_inserted_id": tavily_raw_inserted_id,
             }
 
-            self.success_logger.info("Step 6: Integration completed. Final JSON: %s", json.dumps(final_doc, default=str))
-            print(f"Integration JSON:\n{json.dumps(final_doc, indent=2, ensure_ascii=False)}")
-
-            # Save raw data to Mongo
-            tavily_raw_doc = {
-                "run_id": run_id,
-                "query_id": query_id,
-                "category": category,
-                "provider": "tavily",
-                "query": query_text,
-                "timestamp_start": tavily_call["timestamp_start"],
-                "timestamp_end": tavily_call["timestamp_end"],
-                "duration_ms": tavily_call["duration_ms"],
-                "status": tavily_call["status"],
-                "error": tavily_call["error"],
-                "attempt": tavily_call["attempt"],
-                "full_response": tavily_call["full_response"],
-                "results": tavily_call["results"],
-            }
-
-            tavily_raw_inserted_id = self._save_one(
-                self.tavily_raw_collection_name,
-                tavily_raw_doc,
-                "tavily_raw",
-                "insert_one",
-            )
-            final_doc["tavily_raw_inserted_id"] = tavily_raw_inserted_id
-
-            # Save evaluated data to Mongo
             self._save_one(
                 self.tavily_evaluated_collection_name,
                 final_doc,
                 "tavily_evaluated",
                 "insert_one",
             )
-
-            # Step 7: Send via Firehose
-            print("7. Sending data via Kinesis Firehose to S3...")
-            firehose_res = self.producer.send_record(final_doc)
-            self.success_logger.info("Step 7: Firehose PutRecord executed. Response: %s", firehose_res)
-
-            # Step 8: S3 Validation
-            print("8. Validating file arrival in S3 (checking bucket)...")
-            time.sleep(5) # Brief wait for buffering
-            s3_objects = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
-            if 'Contents' in s3_objects:
-                msg = "S3 Validation: Files found in bucket."
-                print(msg)
-                self.success_logger.info("Step 8: " + msg)
-            else:
-                msg = "S3 Validation: No files detected yet (Firehose may be buffering)."
-                print(msg)
-                self.success_logger.info("Step 8: " + msg)
-
-            # Step 9: Finish
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
-            end_ts = end_time.strftime("%Y-%m-%d %H:%M:%S")
-
-            summary_msg = (f"Agent finished processing query {query_id}. "
-                           f"Raw data saved in Mongo ({self.tavily_raw_collection_name}), "
-                           f"Evaluation saved in ({self.tavily_evaluated_collection_name}), "
-                           f"Data sent to S3 bucket: {self.bucket_name}. "
-                           f"End time: {end_ts}, Duration: {duration:.2f}s")
-            
-            print(f"\n9. {summary_msg}")
-            self.success_logger.info("Step 9: %s", summary_msg)
 
             self.success_logger.info(
                 "agent run success | run_id=%s | query_id=%s | category=%s | duration_ms=%s",
