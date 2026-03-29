@@ -32,13 +32,13 @@ class ToyAgent:
         except Exception as e:
             print(f"Failed to connect to MongoDB: {e}")
 
-        # # AWS Firehose Setup
-        # try:
-        #     self.firehose = boto3.client("firehose", aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"), region_name=os.getenv("AWS_REGION"))
-        #     self.stream_name = os.getenv("FIREHOSE_STREAM_NAME")
-        #     print(f"✅ Connected to AWS Firehose: {self.stream_name}")
-        # except Exception as e:
-        #     print(f"Failed to connect to AWS: {e}")
+        # AWS Firehose Setup
+        try:
+            self.firehose = boto3.client("firehose", aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"), region_name=os.getenv("AWS_REGION"))
+            self.stream_name = os.getenv("FIREHOSE_STREAM_NAME")
+            print(f"✅ Connected to AWS Firehose: {self.stream_name}")
+        except Exception as e:
+            print(f"Failed to connect to AWS: {e}")
 
     def run_task(self, query):
         print(f"🔎 Agent is searching for: '{query}'...")
@@ -62,7 +62,7 @@ class ToyAgent:
         }
 
         self.save_to_mongo(metadata)
-        # self.send_to_firehose(metadata)
+        self.send_to_firehose(metadata)
 
         return metadata
 
@@ -74,20 +74,19 @@ class ToyAgent:
         except Exception as e:
             print(f"⚠️ Error saving to Mongo: {e}")
 
-    # def send_to_firehose(self, data):
-    #     try:
-    #         # Convert to JSON and add a newline (critical for Snowflake!)
-    #         payload = json.dumps(data) + "\n"
+    def send_to_firehose(self, data):
+        try:
+            # Convert to JSON and add a newline (critical for Snowflake!)
+            payload = json.dumps(data) + "\n"
 
-    #         response = self.firehose.put_record(DeliveryStreamName=self.stream_name, Record={"Data": payload})
-    #         print(f"🚀 Sent to Firehose! Record ID: {response['RecordId']}")
-    #     except Exception as e:
-    #         print(f"⚠️ Error sending to Firehose: {e}")
+            response = self.firehose.put_record(DeliveryStreamName=self.stream_name, Record={"Data": payload})
+            print(f"🚀 Sent to Firehose! Record ID: {response['RecordId']}")
+        except Exception as e:
+            print(f"⚠️ Error sending to Firehose: {e}")
 
 
 if __name__ == "__main__":
     agent = ToyAgent()
-    meta = agent.run_task("What is your stance on the 'Oxford Comma'?")
-    meta = agent.run_task("Can you help me brainstorm a 'blue ocean' strategy for a new app in 2026?")
-    meta = agent.run_task("How do you prioritize information when you find two credible but conflicting sources?")
+    # meta = agent.run_task("what is the best stock to invest in right now?")
+    meta = agent.run_task("who is the president of the united states?")
     print(json.dumps(meta, indent=4, default=str))
