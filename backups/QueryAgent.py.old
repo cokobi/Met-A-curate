@@ -1,0 +1,570 @@
+# src/agents/query_agent.py
+import os
+import time
+import uuid
+import json
+import logging
+import random
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, List, Tuple
+
+import httpx
+from dotenv import load_dotenv
+from tavily import TavilyClient
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
+load_dotenv()
+
+
+class QueryAgent:
+    """
+    Autonomous agent for a single query.
+    - Calls Tavily and/or Serper
+    - Writes provider metadata into separate Mongo collections
+    - Writes success/failure logs into TXT files for monitoring
+    """
+
+    def __init__(
+        self,
+        mongo_db_name: str = "agent_metadata",
+        tavily_collection: str = "tavily_metadata",
+        serper_collection: str = "serper_metadata",
+        runs_collection: str = "query_agent_runs",
+        log_dir: Optional[str] = None,
+        max_retries_http: int = 3,
+        max_retries_tavily: int = 3,
+        http_timeout_s: float = 30.0,
+    ):
+        self.mongo_db_name = mongo_db_name
+        self.tavily_collection = tavily_collection
+        self.serper_collection = serper_collection
+        self.runs_collection = runs_collection
+
+        self.max_retries_http = max_retries_http
+        self.max_retries_tavily = max_retries_tavily
+        self.http_timeout_s = http_timeout_s
+
+        self.tavily_client = self._init_tavily()
+        self.mongo_client = self._init_mongo()
+        self.db = self.mongo_client[self.mongo_db_name]
+
+        self.log_dir = log_dir or os.path.join(os.getcwd(), "monitoring_logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._setup_logging()
+
+        # Serper config
+        self.serper_api_key = os.getenv("SERPER_API_KEY") or os.getenv("SERPER_DEV_API_KEY")
+        if not self.serper_api_key:
+            raise ValueError("Missing SERPER_API_KEY (or SERPER_DEV_API_KEY) in .env")
+        self.serper_endpoint = os.getenv("SERPER_ENDPOINT", "https://google.serper.dev/search")
+        self.serper_num_results = int(os.getenv("SERPER_NUM_RESULTS", "10"))
+
+    def _init_tavily(self) -> TavilyClient:
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if not tavily_key:
+            raise ValueError("Missing TAVILY_API_KEY in .env")
+        return TavilyClient(api_key=tavily_key)
+
+    def _init_mongo(self) -> MongoClient:
+        mongo_uri = os.getenv("MONGO_URI")
+        if not mongo_uri:
+            raise ValueError("Missing MONGO_URI in .env")
+        # Note: keep default TLS behavior; adjust tlsCAFile if you need custom CA.
+        return MongoClient(mongo_uri)
+
+    def _setup_logging(self) -> None:
+        # Use a per-process logger to avoid duplicate handlers in case of re-instantiation.
+        today = datetime.now().strftime("%Y-%m-%d")
+        success_path = os.path.join(self.log_dir, f"query_agent_success_{today}.txt")
+        failure_path = os.path.join(self.log_dir, f"query_agent_failure_{today}.txt")
+
+        self.success_logger = logging.getLogger("query_agent_success")
+        self.failure_logger = logging.getLogger("query_agent_failure")
+
+        self.success_logger.setLevel(logging.INFO)
+        self.failure_logger.setLevel(logging.INFO)
+
+        # Prevent duplicate handlers if __init__ called multiple times.
+        if not self.success_logger.handlers:
+            success_handler = logging.FileHandler(success_path, encoding="utf-8")
+            success_handler.setLevel(logging.INFO)
+            success_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+            self.success_logger.addHandler(success_handler)
+
+        if not self.failure_logger.handlers:
+            failure_handler = logging.FileHandler(failure_path, encoding="utf-8")
+            failure_handler.setLevel(logging.INFO)
+            failure_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+            self.failure_logger.addHandler(failure_handler)
+
+    def close(self) -> None:
+        try:
+            self.mongo_client.close()
+        except Exception:
+            # Closing should not crash the agent.
+            pass
+
+    def __enter__(self) -> "QueryAgent":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _now_ts(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _duration_ms(self, start_perf: float) -> float:
+        return (time.perf_counter() - start_perf) * 1000.0
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        # Exponential backoff + jitter
+        base = 0.8
+        jitter = random.uniform(0.0, 0.25)
+        delay_s = (base * (2 ** (attempt - 1))) + jitter
+        time.sleep(delay_s)
+
+    def _save_one(self, collection_name: str, doc: Dict[str, Any], *, provider: str, action: str) -> Dict[str, Any]:
+        """
+        action: "insert_one"
+        Logs both success and failure for Mongo writes.
+        """
+        try:
+            collection = self.db[collection_name]
+            result = collection.insert_one(doc)
+            self.success_logger.info(
+                "mongo write success | provider=%s | action=%s | collection=%s | inserted_id=%s | query_id=%s | category=%s",
+                provider,
+                action,
+                collection_name,
+                str(result.inserted_id),
+                str(doc.get("query_id")),
+                str(doc.get("category")),
+            )
+            return {"inserted_id": str(result.inserted_id)}
+        except PyMongoError as e:
+            self.failure_logger.error(
+                "mongo write failure | provider=%s | action=%s | collection=%s | error=%s | query_id=%s | category=%s | run_id=%s",
+                provider,
+                action,
+                collection_name,
+                repr(e),
+                str(doc.get("query_id")),
+                str(doc.get("category")),
+                str(doc.get("run_id")),
+            )
+            raise
+        except Exception as e:
+            self.failure_logger.error(
+                "mongo write failure (unknown) | provider=%s | action=%s | collection=%s | error=%s | query_id=%s | category=%s | run_id=%s",
+                provider,
+                action,
+                collection_name,
+                repr(e),
+                str(doc.get("query_id")),
+                str(doc.get("category")),
+                str(doc.get("run_id")),
+            )
+            raise
+
+    def _tavily_extract_results(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        results = response.get("results", []) or []
+        extracted = []
+        for r in results:
+            extracted.append(
+                {
+                    "url": r.get("url"),
+                    "score": r.get("score"),
+                    "title": r.get("title"),
+                    "content": r.get("content"),  # may be None depending on Tavily config
+                }
+            )
+        return extracted
+
+    def _call_tavily(
+        self,
+        *,
+        query_text: str,
+        query_id: str,
+        category: str,
+        run_id: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        start_perf = time.perf_counter()
+        timestamp_start = self._now_ts()
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries_tavily + 1):
+            try:
+                tavily_start = time.perf_counter()
+                response = self.tavily_client.search(query_text, search_depth="basic")
+                duration_ms = (time.perf_counter() - tavily_start) * 1000.0
+                timestamp_end = self._now_ts()
+
+                extracted = self._tavily_extract_results(response)
+
+                doc = {
+                    "run_id": run_id,
+                    "query_id": query_id,
+                    "category": category,
+                    "provider": "tavily",
+                    "query": query_text,
+                    "timestamp_start": timestamp_start,
+                    "timestamp_end": timestamp_end,
+                    "duration_ms": round(duration_ms, 2),
+                    "status": "success",
+                    "results_count": len(extracted),
+                    "results": extracted,
+                    "full_response": response,
+                }
+
+                save_info = self._save_one(
+                    self.tavily_collection,
+                    doc,
+                    provider="tavily",
+                    action="insert_one",
+                )
+                return doc, save_info
+            except Exception as e:
+                last_exc = e
+                self.failure_logger.error(
+                    "http/tavily failure | provider=tavily | attempt=%s | error=%s | query_id=%s | category=%s | run_id=%s",
+                    attempt,
+                    repr(e),
+                    str(query_id),
+                    str(category),
+                    str(run_id),
+                )
+                if attempt < self.max_retries_tavily:
+                    self._sleep_backoff(attempt)
+                    continue
+                break
+
+        # If all retries failed
+        timestamp_end = self._now_ts()
+        doc = {
+            "run_id": run_id,
+            "query_id": query_id,
+            "category": category,
+            "provider": "tavily",
+            "query": query_text,
+            "timestamp_start": timestamp_start,
+            "timestamp_end": timestamp_end,
+            "duration_ms": round(self._duration_ms(start_perf), 2),
+            "status": "failure",
+            "error": repr(last_exc) if last_exc else "unknown error",
+        }
+        # Optionally save failure doc too (depends on how much data you want).
+        # We'll save it so you can inspect failures later.
+        save_info = self._save_one(
+            self.tavily_collection,
+            doc,
+            provider="tavily",
+            action="insert_one",
+        )
+        return doc, save_info
+
+    def _call_serper(
+        self,
+        *,
+        query_text: str,
+        query_id: str,
+        category: str,
+        run_id: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        start_perf = time.perf_counter()
+        timestamp_start = self._now_ts()
+
+        payload = {"q": query_text, "num": self.serper_num_results}
+        headers = {
+            "X-API-KEY": self.serper_api_key,
+            "Content-Type": "application/json",
+        }
+
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, self.max_retries_http + 1):
+            try:
+                with httpx.Client(timeout=self.http_timeout_s) as client:
+                    serper_start = time.perf_counter()
+                    resp = client.post(self.serper_endpoint, headers=headers, json=payload)
+                    elapsed_ms = (time.perf_counter() - serper_start) * 1000.0
+
+                # Raise for HTTP status >= 400
+                if resp.status_code >= 400:
+                    # log detailed HTTP error
+                    body_preview = (resp.text or "")[:1500]
+                    self.failure_logger.error(
+                        "http failure | provider=serper | attempt=%s | status_code=%s | query_id=%s | category=%s | run_id=%s | response_preview=%s",
+                        attempt,
+                        resp.status_code,
+                        str(query_id),
+                        str(category),
+                        str(run_id),
+                        body_preview,
+                    )
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code} from Serper",
+                        request=resp.request,
+                        response=resp,
+                    )
+
+                data = resp.json()
+                timestamp_end = self._now_ts()
+
+                organic = data.get("organic", []) or []
+                extracted = []
+                for item in organic:
+                    extracted.append(
+                        {
+                            "url": item.get("link"),
+                            "title": item.get("title"),
+                            "snippet": item.get("snippet"),
+                            "position": item.get("position"),
+                        }
+                    )
+
+                doc = {
+                    "run_id": run_id,
+                    "query_id": query_id,
+                    "category": category,
+                    "provider": "serper",
+                    "query": query_text,
+                    "timestamp_start": timestamp_start,
+                    "timestamp_end": timestamp_end,
+                    "duration_ms": round(elapsed_ms, 2),
+                    "status": "success",
+                    "results_count": len(extracted),
+                    "results": extracted,
+                    "full_response": data,
+                    # Keep request metadata (without leaking API keys)
+                    "request": {
+                        "endpoint": self.serper_endpoint,
+                        "payload": payload,
+                    },
+                }
+
+                save_info = self._save_one(
+                    self.serper_collection,
+                    doc,
+                    provider="serper",
+                    action="insert_one",
+                )
+                return doc, save_info
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                last_exc = e
+                self.failure_logger.error(
+                    "http failure (network/timeout) | provider=serper | attempt=%s | error=%s | query_id=%s | category=%s | run_id=%s",
+                    attempt,
+                    repr(e),
+                    str(query_id),
+                    str(category),
+                    str(run_id),
+                )
+                if attempt < self.max_retries_http:
+                    self._sleep_backoff(attempt)
+                    continue
+                break
+
+            except Exception as e:
+                last_exc = e
+                self.failure_logger.error(
+                    "http failure (unknown) | provider=serper | attempt=%s | error=%s | query_id=%s | category=%s | run_id=%s",
+                    attempt,
+                    repr(e),
+                    str(query_id),
+                    str(category),
+                    str(run_id),
+                )
+                if attempt < self.max_retries_http:
+                    self._sleep_backoff(attempt)
+                    continue
+                break
+
+        # All retries failed
+        timestamp_end = self._now_ts()
+        doc = {
+            "run_id": run_id,
+            "query_id": query_id,
+            "category": category,
+            "provider": "serper",
+            "query": query_text,
+            "timestamp_start": timestamp_start,
+            "timestamp_end": timestamp_end,
+            "duration_ms": round(self._duration_ms(start_perf), 2),
+            "status": "failure",
+            "error": repr(last_exc) if last_exc else "unknown error",
+            "request": {
+                "endpoint": self.serper_endpoint,
+                "payload": payload,
+            },
+        }
+
+        save_info = self._save_one(
+            self.serper_collection,
+            doc,
+            provider="serper",
+            action="insert_one",
+        )
+        return doc, save_info
+
+    def run_single_query(
+        self,
+        *,
+        query_text: str,
+        query_id: str,
+        category: str,
+        use_tavily: bool = True,
+        use_serper: bool = True,
+    ) -> Dict[str, Any]:
+        run_id = str(uuid.uuid4())
+        timestamp_start = self._now_ts()
+        start_perf = time.perf_counter()
+
+        # Start log
+        self.success_logger.info(
+            "agent run start | run_id=%s | query_id=%s | category=%s | query=%s | timestamp_start=%s",
+            run_id,
+            str(query_id),
+            str(category),
+            query_text,
+            timestamp_start,
+        )
+
+        tavily_doc = None
+        serper_doc = None
+        overall_status = "success"
+        error_msg = None
+
+        try:
+            if use_tavily:
+                tavily_doc, _ = self._call_tavily(
+                    query_text=query_text,
+                    query_id=query_id,
+                    category=category,
+                    run_id=run_id,
+                )
+
+            if use_serper:
+                serper_doc, _ = self._call_serper(
+                    query_text=query_text,
+                    query_id=query_id,
+                    category=category,
+                    run_id=run_id,
+                )
+
+            # If either provider failed and you want strictness, adjust logic here.
+            # We detect failure based on saved doc status.
+            provider_failures = []
+            if tavily_doc and tavily_doc.get("status") != "success":
+                provider_failures.append("tavily")
+            if serper_doc and serper_doc.get("status") != "success":
+                provider_failures.append("serper")
+            if provider_failures:
+                overall_status = "partial_success"
+
+            duration_ms = round(self._duration_ms(start_perf), 2)
+            timestamp_end = self._now_ts()
+
+            run_doc = {
+                "run_id": run_id,
+                "query_id": query_id,
+                "category": category,
+                "timestamp_start": timestamp_start,
+                "timestamp_end": timestamp_end,
+                "duration_ms": duration_ms,
+                "status": overall_status,
+                "error": error_msg,
+                "query": query_text,
+                "tavily": {
+                    "status": tavily_doc.get("status") if tavily_doc else None,
+                    "results_count": tavily_doc.get("results_count") if tavily_doc else None,
+                },
+                "serper": {
+                    "status": serper_doc.get("status") if serper_doc else None,
+                    "results_count": serper_doc.get("results_count") if serper_doc else None,
+                },
+            }
+
+            self._save_one(
+                self.runs_collection,
+                run_doc,
+                provider="query_agent",
+                action="insert_one",
+            )
+
+            self.success_logger.info(
+                "agent run success | run_id=%s | query_id=%s | category=%s | duration_ms=%s | timestamp_end=%s",
+                run_id,
+                str(query_id),
+                str(category),
+                str(duration_ms),
+                timestamp_end,
+            )
+            return run_doc
+
+        except Exception as e:
+            overall_status = "error"
+            error_msg = repr(e)
+            duration_ms = round(self._duration_ms(start_perf), 2)
+            timestamp_end = self._now_ts()
+
+            # Log end with error
+            self.failure_logger.error(
+                "agent run error | run_id=%s | query_id=%s | category=%s | duration_ms=%s | timestamp_end=%s | error=%s",
+                run_id,
+                str(query_id),
+                str(category),
+                str(duration_ms),
+                timestamp_end,
+                error_msg,
+            )
+
+            run_doc = {
+                "run_id": run_id,
+                "query_id": query_id,
+                "category": category,
+                "timestamp_start": timestamp_start,
+                "timestamp_end": timestamp_end,
+                "duration_ms": duration_ms,
+                "status": overall_status,
+                "error": error_msg,
+                "query": query_text,
+                "tavily": {
+                    "status": tavily_doc.get("status") if tavily_doc else None,
+                } if tavily_doc else None,
+                "serper": {
+                    "status": serper_doc.get("status") if serper_doc else None,
+                } if serper_doc else None,
+            }
+
+            # Try to persist run failure too
+            try:
+                self._save_one(
+                    self.runs_collection,
+                    run_doc,
+                    provider="query_agent",
+                    action="insert_one",
+                )
+            except Exception:
+                # Avoid hiding the main exception in case Mongo is down.
+                pass
+
+            return run_doc
+
+
+# Optional: quick manual test with environment variables
+if __name__ == "__main__":
+    # Example single query
+    query_text = "How do meteorologists measure wind speed and direction"
+    query_id = "weather_001"
+    category = "weather"
+
+    with QueryAgent() as agent:
+        agent.run_single_query(
+            query_text=query_text,
+            query_id=query_id,
+            category=category,
+            use_tavily=True,
+            use_serper=True,
+        )
