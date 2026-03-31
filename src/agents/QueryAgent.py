@@ -642,17 +642,17 @@ TAVILY_BEST_RESULT_TEXT:
             self.success_logger.info("Step 7: Firehose PutRecord executed. Response: %s", firehose_res)
 
             # Step 8: S3 Validation
-            print("8. Validating file arrival in S3 (checking bucket)...")
-            time.sleep(5) # Brief wait for buffering
-            s3_objects = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
-            if 'Contents' in s3_objects:
-                msg = "S3 Validation: Files found in bucket."
-                print(msg)
-                self.success_logger.info("Step 8: " + msg)
-            else:
-                msg = "S3 Validation: No files detected yet (Firehose may be buffering)."
-                print(msg)
-                self.success_logger.info("Step 8: " + msg)
+            # print("8. Validating file arrival in S3 (checking bucket)...")
+            # time.sleep(5) # Brief wait for buffering
+            # s3_objects = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
+            # if 'Contents' in s3_objects:
+            #     msg = "S3 Validation: Files found in bucket."
+            #     print(msg)
+            #     self.success_logger.info("Step 8: " + msg)
+            # else:
+            #     msg = "S3 Validation: No files detected yet (Firehose may be buffering)."
+            #     print(msg)
+            #     self.success_logger.info("Step 8: " + msg)
 
             # Step 9: Finish
             end_time = datetime.now()
