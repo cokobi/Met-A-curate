@@ -15,26 +15,27 @@ def main():
 
     from QueryAgent import TavilyEvaluatorAgent
 
-    # Single run mode
-    with TavilyEvaluatorAgent() as agent:
-        final_doc = agent.run_one_query()
-
-    print(json.dumps(final_doc, indent=2, ensure_ascii=False, default=str))
+    itterations = 50
 
     # Continuous looping mode
-    # print("Starting continuous evaluation loop...")
-    # while True:
-    #     try:
-    #         with TavilyEvaluatorAgent() as agent:
-    #             agent.run_one_query()
-    #         time.sleep(5)
-    #     except Exception as e:
-    #         if "No eligible queries found" in str(e):
-    #             print("No more eligible queries for today. Stopping loop.")
-    #             break
-    #         print(f"Loop encountered an error: {e}")
-    #         print("Waiting 30 seconds before retrying...")
-    #         time.sleep(30)
+    print("Starting continuous evaluation loop (max 50 iterations)...")
+    for i in range(1, itterations+1):
+        try:
+            print(f"\n--- Iteration {i}/{itterations} ---")
+            with TavilyEvaluatorAgent() as agent:
+                final_doc = agent.run_one_query()
+            print(json.dumps(final_doc, indent=2, ensure_ascii=False, default=str))
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("\nLoop interrupted by user. Stopping.")
+            break
+        except Exception as e:
+            if "No eligible queries found" in str(e):
+                print("No more eligible queries for today. Stopping loop.")
+                break
+            print(f"Loop encountered an error: {e}")
+            print("Waiting 30 seconds before retrying...")
+            time.sleep(30)
 
 
 if __name__ == "__main__":
